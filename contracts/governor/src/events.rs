@@ -179,3 +179,15 @@ pub fn vote_cast(
         (support, rationale),
     );
 }
+
+pub fn set_min_quorum_bps(
+    env: &Env,
+    caller: &Address,
+    old_min_quorum_bps: u32,
+    new_min_quorum_bps: u32,
+) {
+    env.events().publish(
+        (symbol_short!("quorum"), caller.clone()),
+        (old_min_quorum_bps, new_min_quorum_bps),
+    );
+}

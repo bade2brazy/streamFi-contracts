@@ -95,6 +95,7 @@ impl DripGovernor {
         s.set(&DataKey::MaxRatePerSecond, &1_000_000_000_000_000_i128);
         s.set(&DataKey::FactoryAddress, &factory_address);
         s.set(&DataKey::ForceCancelPauseSecs, &2_592_000_u64); // 30 days
+        s.set(&DataKey::MinQuorumBps, &0_u32);
 
         role::grant(&env, Role::Admin, &authority);
         role::grant(&env, Role::FeeManager, &authority);
@@ -656,6 +657,62 @@ impl DripGovernor {
         Ok(())
     }
 
+    /// Sets the minimum quorum threshold in basis points (10,000 = 100%).
+    ///
+    /// Only an `Admin` may call this.
+    pub fn set_min_quorum_bps(env: Env, caller: Address, min_quorum_bps: u32) -> Result<(), Error> {
+        if min_quorum_bps > 10_000 {
+            return Err(Error::InvalidParam);
+        }
+        assert_not_paused(&env)?;
+        role::require_role_or_admin(&env, &caller, Role::Admin)?;
+        let old_min_quorum_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinQuorumBps)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinQuorumBps, &min_quorum_bps);
+        events::set_min_quorum_bps(&env, &caller, old_min_quorum_bps, min_quorum_bps);
+        Ok(())
+    }
+
+    /// Read-only: current minimum quorum in basis points.
+    pub fn min_quorum_bps(env: Env) -> Result<u32, Error> {
+        Ok(config::load(&env)?.min_quorum_bps)
+    }
+
+    /// Sets the total governance supply used for quorum calculations.
+    ///
+    /// Only an `Admin` may call this.
+    pub fn set_governance_supply(env: Env, caller: Address, supply: u64) -> Result<(), Error> {
+        if supply == 0 {
+            return Err(Error::InvalidParam);
+        }
+        assert_not_paused(&env)?;
+        role::require_role_or_admin(&env, &caller, Role::Admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceSupply, &supply);
+        Ok(())
+    }
+
+    /// Read-only: current governance supply (defaults to admin_count if not explicitly set).
+    pub fn governance_supply(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::GovernanceSupply)
+            .unwrap_or_else(|| {
+                let admin_count: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AdminCount)
+                    .unwrap_or(1);
+                admin_count as u64
+            })
+    }
+
     // ── Proposals (Admin-gated) ──────────────────────────────────────────────
 
     /// Create a new governance proposal.
@@ -682,6 +739,8 @@ impl DripGovernor {
             created_at: env.ledger().timestamp(),
             execution_window_secs,
             status: storage::ProposalStatus::Pending,
+            for_votes: 0,
+            against_votes: 0,
         };
 
         env.storage()
@@ -706,11 +765,20 @@ impl DripGovernor {
         Self::MIN_EXECUTION_DELAY
     }
 
+    /// Read-only: get a proposal by ID.
+    pub fn get_proposal(env: Env, proposal_id: u64) -> Result<Proposal, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Proposal(proposal_id))
+            .ok_or(Error::ProposalNotFound)
+    }
+
     /// Execute a proposal that has passed voting.
     ///
     /// Fails with `TimelockNotMet` if the proposal has not elapsed MIN_EXECUTION_DELAY.
     /// Fails with `ProposalExpired` if the execution window has elapsed.
     /// Fails with `ProposalNotPending` if the proposal has been executed or cancelled.
+    /// Fails with `QuorumNotMet` if total votes (for_votes + against_votes) do not reach minimum quorum.
     pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), Error> {
         ttl::bump(&env);
 
@@ -730,6 +798,27 @@ impl DripGovernor {
         }
         if elapsed > proposal.execution_window_secs.saturating_add(Self::MIN_EXECUTION_DELAY) {
             return Err(Error::ProposalExpired);
+        }
+
+        let min_quorum_bps = config::load(&env)?.min_quorum_bps;
+        if min_quorum_bps > 0 {
+            let total_supply: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GovernanceSupply)
+                .unwrap_or_else(|| {
+                    let admin_count: u32 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::AdminCount)
+                        .unwrap_or(1);
+                    admin_count as u64
+                });
+            let quorum_threshold = ((total_supply as u128 * min_quorum_bps as u128 + 9_999) / 10_000) as u64;
+            let total_votes = proposal.for_votes.saturating_add(proposal.against_votes);
+            if total_votes < quorum_threshold {
+                return Err(Error::QuorumNotMet);
+            }
         }
 
         proposal.status = storage::ProposalStatus::Executed;
@@ -785,7 +874,7 @@ impl DripGovernor {
         voter.require_auth();
         ttl::bump(&env);
 
-        let proposal: storage::Proposal = env
+        let mut proposal: storage::Proposal = env
             .storage()
             .instance()
             .get(&DataKey::Proposal(proposal_id))
@@ -799,6 +888,16 @@ impl DripGovernor {
         if elapsed > proposal.execution_window_secs {
             return Err(Error::ProposalExpired);
         }
+
+        if support {
+            proposal.for_votes = proposal.for_votes.saturating_add(1);
+        } else {
+            proposal.against_votes = proposal.against_votes.saturating_add(1);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
 
         events::vote_cast(&env, &voter, proposal_id, support, rationale);
         Ok(())

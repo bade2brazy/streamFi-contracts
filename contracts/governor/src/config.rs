@@ -17,6 +17,8 @@ pub struct GovernorConfig {
     /// (e.g. 7 days for payroll, 90 days for long-horizon vesting) instead
     /// of the previously hardcoded 30-day constant.
     pub force_cancel_pause_secs: u64,
+    /// Minimum quorum threshold in basis points (10,000 = 100%).
+    pub min_quorum_bps: u32,
 }
 
 /// Load the governor configuration from instance storage.
@@ -43,5 +45,6 @@ pub fn load(env: &Env) -> Result<GovernorConfig, Error> {
             .unwrap_or(1_000_000_000_000_000),
         factory_address,
         force_cancel_pause_secs: s.get(&DataKey::ForceCancelPauseSecs).unwrap_or(2_592_000), // 30 days
+        min_quorum_bps: s.get(&DataKey::MinQuorumBps).unwrap_or(0),
     })
 }

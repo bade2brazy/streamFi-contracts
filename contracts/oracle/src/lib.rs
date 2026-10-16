@@ -117,6 +117,8 @@ pub enum DataKey {
     PairSymbolSubmission(Symbol, Symbol, Address),
     /// Bounded reporter index for one Symbol pair.
     PairSymbolReporters(Symbol, Symbol),
+    /// Configurable maximum staleness in seconds.
+    MaxStalenessSeconds,
 }
 
 /// Configuration parameters for the TWAP oracle.
@@ -290,6 +292,8 @@ pub enum Error {
     PriceNotFound = 1022,
     /// A pair already has the maximum five active reporters.
     TooManyPairReporters = 1023,
+    /// Last price update exceeds the allowed staleness threshold.
+    StalePriceFeed = 1024,
 }
 
 #[contract]
@@ -772,15 +776,13 @@ impl TwapOracle {
 
     /// Read-only: the most recent raw price submission from any feeder.
     ///
-    /// Returns the single most recent `PriceData` across all feeders, without any
-    /// TWAP aggregation or staleness checking. Useful for detecting anomalies in the
-    /// latest raw feed signal (e.g., a price spike) independently of the smoothed TWAP.
-    ///
-    /// The `updated_at` timestamp is the ledger time of the submission.
-    /// If multiple feeders submitted at the same block, returns one of them (order unspecified).
+    /// Returns the single most recent `PriceData` across all feeders.
+    /// Verifies that the observation has not exceeded the maximum staleness threshold,
+    /// returning `Error::StalePriceFeed` if `env.ledger().timestamp() - price.updated_at > max_staleness`.
     ///
     /// Errors:
     /// - `NoPriceAvailable` if no price has ever been submitted.
+    /// - `StalePriceFeed` if the last price update exceeds the staleness threshold.
     pub fn latest_price(env: Env) -> Result<PriceData, Error> {
         let submitters: Vec<Address> = env
             .storage()
@@ -801,7 +803,78 @@ impl TwapOracle {
             }
         }
 
-        latest.ok_or(Error::NoPriceAvailable)
+        let price = latest
+            .or_else(|| env.storage().instance().get(&DataKey::Price))
+            .ok_or(Error::NoPriceAvailable)?;
+
+        let max_staleness: u64 = if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
+            config.max_staleness
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::MaxStalenessSeconds)
+                .unwrap_or(0)
+        };
+
+        if max_staleness > 0 {
+            let elapsed = env.ledger().timestamp().saturating_sub(price.updated_at);
+            if elapsed > max_staleness {
+                return Err(Error::StalePriceFeed);
+            }
+        }
+
+        Ok(price)
+    }
+
+    /// Read-only: returns the stored price checking staleness against max_staleness threshold.
+    pub fn get_stored_price(env: Env) -> Result<PriceData, Error> {
+        Self::latest_price(env)
+    }
+
+    /// Sets the maximum staleness seconds threshold for price feeds.
+    pub fn set_max_staleness_seconds(
+        env: Env,
+        caller: Address,
+        max_staleness_seconds: u64,
+    ) -> Result<(), Error> {
+        require_not_paused(&env)?;
+        require_role_or_admin(&env, &caller, Role::Admin)?;
+        if max_staleness_seconds == 0 {
+            return Err(Error::InvalidMaxStaleness);
+        }
+        bump_instance(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStalenessSeconds, &max_staleness_seconds);
+        if let Some(mut config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
+            config.max_staleness = max_staleness_seconds;
+            env.storage().instance().set(&DataKey::Config, &config);
+        }
+        Ok(())
+    }
+
+    /// Read-only: get configured maximum staleness seconds.
+    pub fn max_staleness_seconds(env: Env) -> u64 {
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<_, OracleConfig>(&DataKey::Config)
+        {
+            config.max_staleness
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::MaxStalenessSeconds)
+                .unwrap_or(0)
+        }
     }
 
     /// Converts a nominal token amount into its fiat equivalent.
@@ -3543,5 +3616,49 @@ mod tests {
             client.try_set_price(&admin, &token_a, &token_b, &100_000_000u128),
             Err(Ok(Error::ContractPaused))
         );
+    }
+
+    #[test]
+    fn test_latest_price_enforces_staleness_threshold() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+
+        // Configure oracle with max_staleness = 300 seconds
+        let config = OracleConfig {
+            decimals: 8,
+            asset_peg: 1,
+            max_staleness: 300,
+            max_price: 1_000_000_000,
+            min_submit_interval: 0,
+            min_submitters: 1,
+        };
+        client.configure_oracle(&admin, &config);
+
+        // Submitting price at t=0
+        client.submit_price(&feeder, &50_000_000);
+
+        // Fresh price returns successfully
+        let price_data = client.latest_price();
+        assert_eq!(price_data.price, 50_000_000);
+
+        // Boundary test: elapsed == max_staleness (300s) -> still fresh
+        let current_time = env.ledger().timestamp();
+        env.ledger().set_timestamp(current_time + 300);
+        assert!(client.try_latest_price().is_ok());
+
+        // Boundary test: elapsed > max_staleness (301s) -> StalePriceFeed
+        env.ledger().set_timestamp(current_time + 301);
+        let res = client.try_latest_price();
+        assert_eq!(res, Err(Ok(Error::StalePriceFeed)));
+
+        // get_stored_price alias also returns StalePriceFeed
+        assert_eq!(client.try_get_stored_price(), Err(Ok(Error::StalePriceFeed)));
+
+        // Submitting fresh price restores health
+        client.submit_price(&feeder, &52_000_000);
+        assert_eq!(client.latest_price().price, 52_000_000);
     }
 }

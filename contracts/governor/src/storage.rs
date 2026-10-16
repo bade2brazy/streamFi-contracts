@@ -21,6 +21,10 @@ pub struct Proposal {
     pub execution_window_secs: u64,
     /// Current status of the proposal.
     pub status: ProposalStatus,
+    /// Number of votes cast in favor.
+    pub for_votes: u64,
+    /// Number of votes cast against.
+    pub against_votes: u64,
 }
 
 /// Protocol administration roles.
@@ -101,4 +105,8 @@ pub enum DataKey {
     Proposal(u64),
     /// Proposal counter for generating proposal IDs.
     ProposalCounter,
+    /// Minimum quorum threshold in basis points (e.g. 2000 = 20%).
+    MinQuorumBps,
+    /// Optional total governance supply override; defaults to AdminCount if not set.
+    GovernanceSupply,
 }

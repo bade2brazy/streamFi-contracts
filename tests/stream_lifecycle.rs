@@ -145,4 +145,52 @@ mod stream_lifecycle {
         // Contract now holds 10_000 (original) + 50_000 (top-up) = 60_000
         assert_eq!(tok.balance(&client.address), 60_000);
     }
+
+    #[test]
+    fn test_stream_top_up_preserves_accrual_rate() {
+        let env = base_env();
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let rate = 1_000_i128; // 1_000 stroops/s
+        let duration = 3_600_u64; // 1 hour
+
+        let (client, token_addr) =
+            deploy_funded_stream(&env, &sender, &recipient, rate, duration, false);
+        let tok = token::Client::new(&env, &token_addr);
+
+        // At t=0, withdrawable is 0
+        assert_eq!(client.withdrawable(), 0);
+
+        // Advance 500 seconds mid-stream
+        advance(&env, 500);
+        // Recipient has accrued rate * 500 = 500_000
+        assert_eq!(client.withdrawable(), 500_000);
+
+        // Top up mid-stream with 1_000_000 tokens
+        let tok_admin = token::StellarAssetClient::new(&env, &token_addr);
+        tok_admin.mint(&sender, &1_000_000);
+        let initial_balance = tok.balance(&client.address);
+        assert_eq!(initial_balance, 3_600_000);
+
+        client.top_up(&sender, &1_000_000);
+
+        // Stream contract holds original + top-up amount
+        assert_eq!(tok.balance(&client.address), 4_600_000);
+
+        // Accrued amount right after top-up remains identical
+        assert_eq!(client.withdrawable(), 500_000);
+
+        // Advance another 500 seconds (total elapsed = 1000s)
+        advance(&env, 500);
+
+        // Accrual rate is preserved: total accrued is 1000 * 1_000 = 1_000_000
+        assert_eq!(client.withdrawable(), 1_000_000);
+
+        // Verify stopTime does not shift:
+        // Advance past original duration (advance 3000s -> total 4000s > 3600s)
+        advance(&env, 3_000);
+        // Accrual clamps at original duration (3600 * 1000 = 3_600_000)
+        assert_eq!(client.withdrawable(), 3_600_000);
+    }
 }

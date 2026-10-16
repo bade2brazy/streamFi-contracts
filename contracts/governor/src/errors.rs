@@ -35,4 +35,6 @@ pub enum Error {
     ProposalNotPending = 15,
     /// Minimum timelock delay has not elapsed since proposal creation.
     TimelockNotMet = 16,
+    /// Quorum threshold not met for proposal execution.
+    QuorumNotMet = 17,
 }

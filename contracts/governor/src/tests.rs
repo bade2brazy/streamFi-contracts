@@ -166,3 +166,73 @@ fn test_execute_proposal_enforces_timelock_delay() {
     // Now execute succeeds
     assert!(client.try_execute_proposal(&proposal_id).is_ok());
 }
+
+#[test]
+fn test_set_min_quorum_bps_validates_bounds() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+
+    // Initial default is 0
+    assert_eq!(client.min_quorum_bps(), 0);
+
+    // Valid update
+    assert!(client.try_set_min_quorum_bps(&authority, &2000).is_ok());
+    assert_eq!(client.min_quorum_bps(), 2000);
+
+    // 10,000 (100%) is accepted
+    assert!(client.try_set_min_quorum_bps(&authority, &10_000).is_ok());
+    assert_eq!(client.min_quorum_bps(), 10_000);
+
+    // Over 10,000 is rejected
+    assert_eq!(
+        client.try_set_min_quorum_bps(&authority, &10_001),
+        Err(Ok(Error::InvalidParam))
+    );
+
+    // Non-admin rejected
+    let unauthorized = Address::generate(&env);
+    assert!(client.try_set_min_quorum_bps(&unauthorized, &500).is_err());
+}
+
+#[test]
+fn test_execute_proposal_enforces_quorum_threshold() {
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+
+    // Set governance supply to 10 and min_quorum_bps to 2000 (20% -> 2 votes needed)
+    client.set_governance_supply(&authority, &10);
+    client.set_min_quorum_bps(&authority, &2000);
+
+    let proposal_id = client.propose(&authority, &3600);
+
+    // Advance ledger timestamp to satisfy timelock delay
+    let current_time = env.ledger().timestamp();
+    env.ledger().set_timestamp(current_time + 604_800);
+
+    // 0 votes cast -> fails with QuorumNotMet
+    let res = client.try_execute_proposal(&proposal_id);
+    assert_eq!(res, Err(Ok(Error::QuorumNotMet)));
+
+    // Cast 1 vote -> total_votes = 1 < 2 -> fails with QuorumNotMet
+    let voter1 = Address::generate(&env);
+    assert!(client.try_cast_vote(&voter1, &proposal_id, &true).is_ok());
+    let res2 = client.try_execute_proposal(&proposal_id);
+    assert_eq!(res2, Err(Ok(Error::QuorumNotMet)));
+
+    // Cast 2nd vote (against) -> total_votes = 2 >= 2 -> quorum met!
+    let voter2 = Address::generate(&env);
+    assert!(client.try_cast_vote(&voter2, &proposal_id, &false).is_ok());
+
+    let proposal = client.get_proposal(&proposal_id);
+    assert_eq!(proposal.for_votes, 1);
+    assert_eq!(proposal.against_votes, 1);
+
+    // Now execute succeeds!
+    assert!(client.try_execute_proposal(&proposal_id).is_ok());
+}

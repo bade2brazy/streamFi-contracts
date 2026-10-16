@@ -40,4 +40,6 @@ pub enum Error {
     NotAuthorized = 11,
     /// Price feed not found for requested pair.
     PriceNotFound = 12,
+    /// Price feed has not been updated within the allowed max staleness window.
+    StalePriceFeed = 13,
 }

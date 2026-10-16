@@ -99,6 +99,7 @@ mod tests {
             max_rate_per_second: 1_000_000,
             factory_address: Address::generate(env),
             force_cancel_pause_secs: 30 * DAY,
+            min_quorum_bps: 0,
         }
     }
 
